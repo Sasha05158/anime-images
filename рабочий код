@@ -1,0 +1,653 @@
+from tinydb import TinyDB, Query
+from datetime import datetime
+import os
+import json
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    InlineQueryResultArticle,
+    InputTextMessageContent
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    InlineQueryHandler,
+    filters
+)
+
+# ================= TOKEN =================
+TOKEN = "8743292947:AAEyquGztM0E-al3mXGqdtSQl6D-RK0vf4Y"
+CHANNEL_USERNAME = "@catt_anime"
+
+# ================= PATHS =================
+JSON_PATH = r"C:\Users\Lenovo\Desktop\CatBot\anime.json"
+DB_PATH = r"C:\Users\Lenovo\Desktop\CatBot\ratings.json"
+
+# ================= DB INIT =================
+def init_db(path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    needs_reset = True
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                json.load(f)
+            needs_reset = False
+        except Exception:
+            needs_reset = True
+
+    if needs_reset:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"_default": {}}, f, ensure_ascii=False, indent=4)
+
+    return TinyDB(path)
+
+db = init_db(DB_PATH)
+User = Query()
+
+# ================= CHAT =================
+waiting_user = None
+pairs = {}
+
+# ================= LOG =================
+def log(msg):
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}")
+
+# ================= NORMALIZE =================
+def normalize_name(name: str):
+    if not name:
+        return ""
+    return name.split("(")[0].strip().lower()
+
+# ================= ANIME JSON =================
+def get_anime_list():
+    try:
+        with open(JSON_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+# ================= GENRES =================
+def get_genres():
+    genres = set()
+    for anime in get_anime_list():
+        if "genre" in anime:
+            for g in anime["genre"].split("/"):
+                g = g.strip()
+                if g:
+                    genres.add(g)
+    return sorted(genres)
+
+# ================= PROFILE HELPERS =================
+def ensure_user_profile(user_id: int):
+    uid = str(user_id)
+    found = db.search(User.user_id == uid)
+    if found:
+        return found[0]
+
+    db.insert({
+        "user_id": uid,
+        "liked": [],
+        "disliked": [],
+        "last": None
+    })
+    return db.search(User.user_id == uid)[0]
+
+def set_last_watched(user_id: int, anime_name: str):
+    uid = str(user_id)
+    ensure_user_profile(user_id)
+    db.update({"last": anime_name}, User.user_id == uid)
+
+def add_like(user_id: int, anime_name: str):
+    uid = str(user_id)
+    user = ensure_user_profile(user_id)
+
+    liked = user.get("liked", [])
+    disliked = user.get("disliked", [])
+
+    if anime_name not in liked:
+        liked.append(anime_name)
+    if anime_name in disliked:
+        disliked.remove(anime_name)
+
+    db.update({"liked": liked, "disliked": disliked}, User.user_id == uid)
+
+def add_dislike(user_id: int, anime_name: str):
+    uid = str(user_id)
+    user = ensure_user_profile(user_id)
+
+    liked = user.get("liked", [])
+    disliked = user.get("disliked", [])
+
+    if anime_name not in disliked:
+        disliked.append(anime_name)
+    if anime_name in liked:
+        liked.remove(anime_name)
+
+    db.update({"liked": liked, "disliked": disliked}, User.user_id == uid)
+
+def find_anime_index_by_normalized_name(normalized_name: str):
+    for i, anime in enumerate(get_anime_list()):
+        if normalize_name(anime.get("name", "")) == normalized_name:
+            return i
+    return None
+
+def find_anime_index_by_exact_name(raw_name: str):
+    target = normalize_name(raw_name)
+    return find_anime_index_by_normalized_name(target)
+
+# ================= CHAT KEYBOARD =================
+def chat_keyboard_main():
+    return ReplyKeyboardMarkup(
+        [
+            ["💬 Знайти співрозмовника"],
+            ["📊 Профіль"]
+        ],
+        resize_keyboard=True
+    )
+
+def chat_keyboard_chat():
+    return ReplyKeyboardMarkup(
+        [
+            ["🗿 Інший співрозмовник"],
+            ["⛔️ Вийти з діалогу"]
+        ],
+        resize_keyboard=True
+    )
+def chat_keyboard_search():
+    return ReplyKeyboardMarkup(
+        [
+            ["⛔️ Вийти з пошуку"]
+        ],
+        resize_keyboard=True
+    )
+
+def chat_keyboard():
+    return chat_keyboard_main()
+
+# ================= START =================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    genres = get_genres()
+
+    keyboard = [
+        [InlineKeyboardButton("🔎 Шукати за назвою", switch_inline_query_current_chat="")]
+    ]
+    keyboard += [[InlineKeyboardButton(g, callback_data=f"genre_{g}")] for g in genres]
+
+    await update.message.reply_text(
+        "🍥 Обери жанр або шукай:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+    await update.message.reply_text(
+        "💬 Чат доступний нижче",
+        reply_markup=chat_keyboard_main()
+    )  
+
+# ================= INLINE SEARCH =================
+async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.inline_query.query.lower().strip()
+    results = []
+
+    for i, anime in enumerate(get_anime_list()):
+        name = anime.get("name", "")
+        desc = anime.get("description", "")[:80]
+
+        if not query or query in name.lower():
+            results.append(
+                InlineQueryResultArticle(
+                    id=str(i),
+                    title=name,
+                    description=desc,
+                    thumbnail_url=anime.get("image", ""),
+                    input_message_content=InputTextMessageContent(
+                        f"{name}\n\n{anime.get('description', '')}"
+                    )
+                )
+            )
+
+    await update.inline_query.answer(results[:20], cache_time=1)
+
+# ================= SUB CHECK =================
+async def check_subscription(user_id, context):
+    try:
+        member = await context.bot.get_chat_member(CHANNEL_USERNAME, user_id)
+        return member.status in ["member", "administrator", "creator"]
+    except Exception:
+        return False
+
+# ================= ANIME MENU =================
+def anime_menu(idx, user_id=None):
+    anime_list = get_anime_list()
+
+    if idx is None or idx < 0 or idx >= len(anime_list):
+        return "Помилка", None, None
+
+    anime = anime_list[idx]
+    name_raw = anime.get("name", "Без назви")
+    name_norm = normalize_name(name_raw)
+
+    results = db.search((User.anime == name_norm))
+    votes = [r.get("rating") for r in results if isinstance(r.get("rating"), int)]
+    avg = "немає оцінок" if not votes else f"{round(sum(votes) / len(votes), 1)} / 5 ⭐️"
+
+    text = (
+        f"{name_raw} ({anime.get('year', '?')})\n"
+        f"Жанр: {anime.get('genre', '—')}\n"
+        f"Рейтинг: {avg}\n\n"
+        f"{anime.get('description', '')}"
+    )
+
+    keyboard = [
+        [InlineKeyboardButton("🎬 Серії", callback_data=f"episodes_{idx}")],
+        [InlineKeyboardButton("⭐️ Оцінити", callback_data=f"rate_{idx}")],
+        [
+            InlineKeyboardButton("❤️", callback_data=f"like_{idx}"),
+            InlineKeyboardButton("💔", callback_data=f"dislike_{idx}")
+        ],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="genres_back")]
+    ]
+
+    if user_id is not None:
+        set_last_watched(user_id, name_norm)
+
+    return text, InlineKeyboardMarkup(keyboard), anime.get("image")
+
+# ================= SAFE MESSAGE FOR TEXT PAGES =================
+async def replace_message(query, text, markup=None):
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+    await query.message.reply_text(text, reply_markup=markup)
+
+# ================= SAFE MESSAGE FOR PAGES WITH PHOTO =================
+async def replace_keep_media(query, text, markup=None):
+    try:
+        if query.message.photo:
+            await query.message.edit_caption(caption=text, reply_markup=markup)
+        else:
+            await query.message.edit_text(text=text, reply_markup=markup)
+    except Exception:
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await query.message.reply_text(text, reply_markup=markup)
+
+# ================= SEND ANIME PAGE =================
+async def send_anime_page(query, text, markup, photo, user_id=None):
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+    if user_id is not None:
+        anime_name = None
+        try:
+            idx = int(query.data.split("_")[1])
+            anime_name = normalize_name(get_anime_list()[idx].get("name", ""))
+        except Exception:
+            anime_name = None
+        if anime_name:
+            set_last_watched(user_id, anime_name)
+
+    if photo:
+        await query.message.reply_photo(photo=photo, caption=text, reply_markup=markup)
+    else:
+        await query.message.reply_text(text, reply_markup=markup)
+
+# ================= PROFILE RENDER =================
+def build_profile_keyboard(user_id: int):
+    user = ensure_user_profile(user_id)
+    liked = user.get("liked", [])
+    disliked = user.get("disliked", [])
+    last = user.get("last")
+
+    keyboard = []
+
+    if last:
+        idx = find_anime_index_by_normalized_name(last)
+        if idx is not None:
+            anime = get_anime_list()[idx]
+            keyboard.append([InlineKeyboardButton(f"▶️ Останнє: {anime.get('name', last)}", callback_data=f"openanime_{idx}")])
+
+    keyboard.append([InlineKeyboardButton("❤️ Подобається", callback_data="profile_liked")])
+    keyboard.append([InlineKeyboardButton("💔 Не подобається", callback_data="profile_disliked")])
+    keyboard.append([InlineKeyboardButton("⬅️ Меню", callback_data="profile_back")])
+
+    text = (f"❤️ {len(liked)}   💔 {len(disliked)}")
+
+    return text, InlineKeyboardMarkup(keyboard)
+
+def build_profile_list_keyboard(names, empty_text="Пусто"):
+    keyboard = []
+
+    if not names:
+        keyboard.append([InlineKeyboardButton(empty_text, callback_data="noop")])
+    else:
+        for norm_name in names:
+            idx = find_anime_index_by_normalized_name(norm_name)
+            if idx is None:
+                continue
+            anime = get_anime_list()[idx]
+            keyboard.append([InlineKeyboardButton(anime.get("name", norm_name), callback_data=f"openanime_{idx}")])
+
+    keyboard.append([InlineKeyboardButton("⬅️ Профіль", callback_data="profile_show")])
+    return InlineKeyboardMarkup(keyboard)
+
+# ================= CHAT =================
+async def chat_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global waiting_user
+
+    user_id = update.effective_user.id
+    text = update.message.text
+
+    # ===== PROFILE =====
+    if text == "📊 Профіль":
+        profile_text, profile_markup = build_profile_keyboard(user_id)
+        await update.message.reply_text(profile_text, reply_markup=profile_markup)
+
+    # ===== FIND =====
+    elif text == "💬 Знайти співрозмовника":
+
+        if user_id in pairs:
+            await update.message.reply_text(
+                "Ви вже в чаті 😏",
+                reply_markup=chat_keyboard_chat()
+            )
+            return
+
+        if waiting_user == user_id:
+            await update.message.reply_text(
+                "Ти вже шукаєш 😏",
+                reply_markup=chat_keyboard_search()
+            )
+            return
+
+        if waiting_user is None:
+            waiting_user = user_id
+            await update.message.reply_text(
+                "🔍 шукаю...",
+                reply_markup=chat_keyboard_search()
+            )
+        else:
+            partner = waiting_user
+
+            if partner == user_id:
+                await update.message.reply_text(
+                    "Ти вже в черзі 😏",
+                    reply_markup=chat_keyboard_search()
+                )
+                return
+
+            waiting_user = None
+            pairs[user_id] = partner
+            pairs[partner] = user_id
+
+            await context.bot.send_message(
+                user_id,
+                "💬 Знайдено 😏",
+                reply_markup=chat_keyboard_chat()
+            )
+
+            await context.bot.send_message(
+                partner,
+                "💬 Знайдено 😏",
+                reply_markup=chat_keyboard_chat()
+            )
+
+    # ===== EXIT SEARCH =====
+    elif text == "⛔️ Вийти з пошуку":
+        if waiting_user == user_id:
+            waiting_user = None
+            await update.message.reply_text(
+                "❌ Пошук скасовано",
+                reply_markup=chat_keyboard_main()
+            )
+        else:
+            await update.message.reply_text("Ти не в пошуку 😏")
+
+    # ===== OTHER PARTNER =====
+    elif text == "🗿 Інший співрозмовник":
+        if user_id in pairs:
+            partner = pairs[user_id]
+
+            del pairs[user_id]
+            if partner in pairs:
+                del pairs[partner]
+
+            await context.bot.send_message(
+                partner,
+                "🗿 Співрозмовник пішов",
+                reply_markup=chat_keyboard_main()
+            )
+
+        waiting_user = user_id
+
+        await update.message.reply_text(
+            "🔍 новий пошук...",
+            reply_markup=chat_keyboard_search()
+        )
+
+    # ===== EXIT CHAT =====
+    elif text == "⛔️ Вийти з діалогу":
+        if user_id in pairs:
+            partner = pairs[user_id]
+
+            del pairs[user_id]
+            if partner in pairs:
+                del pairs[partner]
+
+            await context.bot.send_message(
+                partner,
+                "⛔️ Співрозмовник вийшов",
+                reply_markup=chat_keyboard_main()
+            )
+
+        if waiting_user == user_id:
+            waiting_user = None
+
+        await update.message.reply_text(
+            "Ви вийшли 😌",
+            reply_markup=chat_keyboard_main()
+        )
+
+    # ===== MESSAGE =====
+    elif user_id in pairs:
+        await context.bot.send_message(pairs[user_id], text)
+
+# ================= CALLBACKS =================
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    user_id_str = str(query.from_user.id)
+    user_id_int = query.from_user.id
+
+    if data == "noop":
+        await query.answer()
+
+    elif data == "profile_back":
+        genres = get_genres()
+        keyboard = [
+            [InlineKeyboardButton("🔎 Шукати за назвою", switch_inline_query_current_chat="")]
+        ]
+        keyboard += [[InlineKeyboardButton(g, callback_data=f"genre_{g}")] for g in genres]
+        await replace_message(query, "🍥 Обери жанр або шукай:", InlineKeyboardMarkup(keyboard))
+
+    elif data == "profile_show":
+        profile_text, profile_markup = build_profile_keyboard(user_id_int)
+        await replace_keep_media(query, profile_text, profile_markup)
+
+    elif data == "profile_liked":
+        user = ensure_user_profile(user_id_int)
+        liked = user.get("liked", [])
+        await replace_message(query, "❤️ Подобається:", build_profile_list_keyboard(liked, "Немає лайків"))
+
+    elif data == "profile_disliked":
+        user = ensure_user_profile(user_id_int)
+        disliked = user.get("disliked", [])
+        await replace_message(query, "💔 Не подобається:", build_profile_list_keyboard(disliked, "Немає дизлайків"))
+
+    elif data.startswith("genre_"):
+        genre = data.split("_", 1)[1]
+
+        filtered = [
+            (i, a) for i, a in enumerate(get_anime_list())
+            if genre.lower() in a.get("genre", "").lower()
+        ]
+
+        keyboard = [[InlineKeyboardButton(a.get("name", "Без назви"), callback_data=f"anime_{i}")] for i, a in filtered]
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="genres_back")])
+
+        await replace_message(query, f"Жанр: {genre}", InlineKeyboardMarkup(keyboard))
+
+    elif data == "genres_back":
+        genres = get_genres()
+
+        keyboard = [
+            [InlineKeyboardButton("🔎 Шукати за назвою", switch_inline_query_current_chat="")]
+        ]
+        keyboard += [[InlineKeyboardButton(g, callback_data=f"genre_{g}")] for g in genres]
+
+        await replace_message(query, "🍥 Жанри:", InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("anime_"):
+        idx = int(data.split("_")[1])
+        text, markup, photo = anime_menu(idx, user_id_int)
+        await send_anime_page(query, text, markup, photo, user_id_int)
+
+    elif data.startswith("openanime_"):
+        idx = int(data.split("_")[1])
+        text, markup, photo = anime_menu(idx, user_id_int)
+        await send_anime_page(query, text, markup, photo, user_id_int)
+
+    elif data.startswith("episodes_"):
+        idx = int(data.split("_")[1])
+
+        if not await check_subscription(user_id_int, context):
+            keyboard = [
+                [InlineKeyboardButton("📢 Підписатися", url=f"https://t.me/{CHANNEL_USERNAME.replace('@', '')}")],
+                [InlineKeyboardButton("✅ Я підписався", callback_data=f"check_sub_{idx}")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data=f"anime_{idx}")]
+            ]
+            await replace_keep_media(query, "Підпишись 😏", InlineKeyboardMarkup(keyboard))
+            return
+
+        anime = get_anime_list()[idx]
+        episodes = anime.get("episodes", [])
+
+        keyboard = []
+        for ep in episodes:
+            title = ep.get("title", "Серія")
+            url = ep.get("url", "")
+            if url:
+                keyboard.append([InlineKeyboardButton(title, url=url)])
+
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"anime_{idx}")])
+
+        if not episodes:
+            await replace_keep_media(query, "🎬 Серії поки нема", InlineKeyboardMarkup(keyboard))
+        else:
+            await replace_keep_media(query, "🎬 Серії:", InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("check_sub_"):
+        idx = int(data.split("_")[2])
+
+        if not await check_subscription(user_id_int, context):
+            await query.answer("Ти не підписаний 😏", show_alert=True)
+            return
+
+        anime = get_anime_list()[idx]
+        episodes = anime.get("episodes", [])
+
+        keyboard = []
+        for ep in episodes:
+            title = ep.get("title", "Серія")
+            url = ep.get("url", "")
+            if url:
+                keyboard.append([InlineKeyboardButton(title, url=url)])
+
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"anime_{idx}")])
+
+        if not episodes:
+            await replace_keep_media(query, "🎬 Серії поки нема", InlineKeyboardMarkup(keyboard))
+        else:
+            await replace_keep_media(query, "🎬 Серії відкриті:", InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("rate_"):
+        idx = int(data.split("_")[1])
+        anime = get_anime_list()[idx]
+        name = normalize_name(anime.get("name", ""))
+
+        current = db.search((User.anime == name) & (User.user_id == user_id_str))
+        current_text = f"\nТвоя оцінка: {current[0]['rating']}⭐️" if current else ""
+
+        keyboard = [[InlineKeyboardButton(f"{i}⭐️", callback_data=f"star_{idx}_{i}") for i in range(1, 6)]]
+        keyboard.append([
+            InlineKeyboardButton("❤️", callback_data=f"like_{idx}"),
+            InlineKeyboardButton("💔", callback_data=f"dislike_{idx}")
+        ])
+        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"anime_{idx}")])
+
+        await replace_keep_media(query, f"Оцініть:{current_text}", InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("star_"):
+        _, idx, stars = data.split("_")
+        idx = int(idx)
+        stars = int(stars)
+
+        anime = get_anime_list()[idx]
+        name = normalize_name(anime.get("name", ""))
+
+        exists = db.search((User.anime == name) & (User.user_id == user_id_str))
+
+        if exists:
+            db.update({"rating": stars}, (User.anime == name) & (User.user_id == user_id_str))
+        else:
+            db.insert({"anime": name, "user_id": user_id_str, "rating": stars})
+
+        text, markup, photo = anime_menu(idx, user_id_int)
+        await send_anime_page(query, text, markup, photo, user_id_int)
+
+    elif data.startswith("like_"):
+        idx = int(data.split("_")[1])
+        anime = get_anime_list()[idx]
+        name = normalize_name(anime.get("name", ""))
+
+        add_like(user_id_int, name)
+        await query.answer("Додано в ❤️", show_alert=False)
+
+    elif data.startswith("dislike_"):
+        idx = int(data.split("_")[1])
+        anime = get_anime_list()[idx]
+        name = normalize_name(anime.get("name", ""))
+
+        add_dislike(user_id_int, name)
+        await query.answer("Додано в 💔", show_alert=False)
+
+# ================= MAIN =================
+def main():
+    log("Бот активовано")
+
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_logic))
+    app.add_handler(InlineQueryHandler(inline_query))
+
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
